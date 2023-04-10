@@ -1,26 +1,87 @@
-// The module 'vscode' contains the VS Code extensibility API
-// Import the module and reference it with the alias vscode in your code below
-import * as vscode from 'vscode';
+import * as vscode from "vscode";
+import * as diff from "diff";
 
-// This method is called when your extension is activated
-// Your extension is activated the very first time the command is executed
-export function activate(context: vscode.ExtensionContext) {
+async function applyPatch() {
+  const workspaceFolder = vscode.workspace.workspaceFolders![0].uri;
 
-	// Use the console to output diagnostic information (console.log) and errors (console.error)
-	// This line of code will only be executed once when your extension is activated
-	console.log('Congratulations, your extension "git-patch-clipboard" is now active!');
+  const patch = await vscode.env.clipboard.readText();
 
-	// The command has been defined in the package.json file
-	// Now provide the implementation of the command with registerCommand
-	// The commandId parameter must match the command field in package.json
-	let disposable = vscode.commands.registerCommand('git-patch-clipboard.helloWorld', () => {
-		// The code you place here will be executed every time your command is executed
-		// Display a message box to the user
-		vscode.window.showInformationMessage('Hello World from git-patch-clipboard!');
-	});
+  if (!patch) {
+    vscode.window.showErrorMessage("No patch data found in clipboard.");
+    return;
+  }
 
-	context.subscriptions.push(disposable);
+  const patchWithoutExtendedHeaders = patch
+    .split("\n")
+    .filter(
+      (line) => !line.startsWith("diff --git") && !line.startsWith("index ")
+    )
+    .join("\n");
+
+  const patchData = diff.parsePatch(patchWithoutExtendedHeaders);
+
+  try {
+    const edit = new vscode.WorkspaceEdit();
+    for (const patchPart of patchData) {
+      if (!patchPart.oldFileName || !patchPart.newFileName) {
+        throw new Error("File name not found in the patch.");
+      }
+
+      const oldFileUri = vscode.Uri.joinPath(
+        workspaceFolder,
+        patchPart.oldFileName
+      );
+      const newFileUri = vscode.Uri.joinPath(
+        workspaceFolder,
+        patchPart.newFileName
+      );
+
+      if (patchPart.oldFileName !== patchPart.newFileName) {
+        await vscode.workspace.fs.rename(oldFileUri, newFileUri);
+      }
+
+      if (patchPart.hunks.length === 0) {
+        await vscode.workspace.fs.delete(newFileUri);
+      } else {
+        let fileContent;
+        try {
+          const fileData = await vscode.workspace.fs.readFile(oldFileUri);
+          fileContent = fileData.toString();
+        } catch (err) {
+          if ((err as any).code === "FileNotFound") {
+            fileContent = "";
+          } else {
+            throw err;
+          }
+        }
+
+        const patchedContent = diff.applyPatch(fileContent, patchPart);
+
+        // @ts-expect-error
+        if (patchedContent === false) {
+          throw new Error(`Failed to apply patch to ${patchPart.oldFileName}`);
+        }
+
+        const patchedContentBuffer = Buffer.from(patchedContent, "utf8");
+        await vscode.workspace.fs.writeFile(newFileUri, patchedContentBuffer);
+      }
+    }
+
+    await vscode.workspace.applyEdit(edit);
+    vscode.window.showInformationMessage("Patch applied successfully.");
+  } catch (err) {
+    vscode.window.showErrorMessage(
+      `Failed to apply patch: ${(err as Error).message}`
+    );
+  }
 }
 
-// This method is called when your extension is deactivated
+export function activate(context: vscode.ExtensionContext) {
+  let disposable = vscode.commands.registerCommand(
+    "gitPatchClipboard.applyPatch",
+    applyPatch
+  );
+  context.subscriptions.push(disposable);
+}
+
 export function deactivate() {}
